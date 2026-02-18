@@ -1070,20 +1070,33 @@ def render_eval_tab(components: dict):
 def render_email_tab(components: dict):
     """Render the email inbox with fetch, display, and agent processing."""
     st.markdown("### Email Inbox")
-    st.caption("Fetch unread emails from your live Gmail account and process them through the agent.")
+    st.caption("Emails are fetched automatically when the agent starts. Click Refresh to update.")
 
     # Initialize email state
     if "fetched_emails" not in st.session_state:
         st.session_state.fetched_emails = []
     if "email_responses" not in st.session_state:
         st.session_state.email_responses = {}
+    if "email_initial_fetch_done" not in st.session_state:
+        st.session_state.email_initial_fetch_done = False
 
     email_tool = components["email_tool"]
 
-    # Fetch button
+    # Auto-fetch on first load (runs once per session)
+    if not st.session_state.email_initial_fetch_done:
+        st.session_state.email_initial_fetch_done = True
+        try:
+            result = email_tool.fetch_unread()
+            if result.success and result.output:
+                st.session_state.fetched_emails = result.output
+                st.toast(f"Loaded {len(result.output)} unread email(s)", icon="")
+        except Exception:
+            pass  # will show empty inbox
+
+    # Manual refresh button
     col1, col2 = st.columns([1, 4])
     with col1:
-        if st.button("Fetch Unread Emails", type="primary", use_container_width=True):
+        if st.button("Refresh", type="primary", use_container_width=True):
             with st.spinner("Connecting to Gmail..."):
                 result = email_tool.fetch_unread()
             if result.success and result.output:
@@ -1105,7 +1118,7 @@ def render_email_tab(components: dict):
     # Display emails
     emails = st.session_state.fetched_emails
     if not emails:
-        st.info("Click 'Fetch Unread Emails' to load your inbox.")
+        st.info("No unread emails found. New emails will appear automatically via the sidebar monitor.")
         return
 
     for idx, em in enumerate(emails):
@@ -1143,6 +1156,8 @@ def render_email_tab(components: dict):
                         components
                     )
                 st.session_state.email_responses[idx] = response
+                # Auto-post to Slack
+                post_result_to_slack(response, f"Email/{sender}", components)
                 st.rerun()
 
             # Show agent response if processed
