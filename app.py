@@ -39,7 +39,6 @@ try:
             os.environ[key] = st.secrets[key]
 except Exception:
     pass  # st.secrets may not exist locally
-
 # ---------------------------------------------------------------------------
 # Part 2: Page configuration and custom CSS
 # ---------------------------------------------------------------------------
@@ -535,6 +534,7 @@ def _email_poll_fragment(components: dict):
     """
     Auto-polling fragment that checks for new unread emails every 30 seconds.
     Runs independently of the main app, so it does not interrupt the chat.
+    Uses st.toast() for floating notifications visible from any tab.
     """
     email_tool = components["email_tool"]
 
@@ -545,6 +545,8 @@ def _email_poll_fragment(components: dict):
         st.session_state.poll_email_subjects = []
     if "poll_last_check" not in st.session_state:
         st.session_state.poll_last_check = "Never"
+    if "poll_seen_ids" not in st.session_state:
+        st.session_state.poll_seen_ids = set()
 
     try:
         result = email_tool.fetch_unread()
@@ -553,20 +555,32 @@ def _email_poll_fragment(components: dict):
 
         if result.success and result.output:
             new_count = len(result.output)
-            old_count = st.session_state.poll_email_count
+            current_ids = set()
+            new_subjects = []
 
+            for e in result.output:
+                eid = e.get("message_id", e.get("subject", ""))
+                current_ids.add(eid)
+                if eid not in st.session_state.poll_seen_ids:
+                    new_subjects.append(e.get("subject", "(no subject)"))
+
+            # Detect genuinely new emails (not seen before)
+            if new_subjects:
+                st.session_state.poll_new_alert = True
+                # Fire a toast notification visible from any tab
+                for subj in new_subjects[:3]:
+                    st.toast(f"New email: {subj[:60]}", icon="")
+            else:
+                st.session_state.poll_new_alert = False
+
+            st.session_state.poll_seen_ids = current_ids
             st.session_state.poll_email_count = new_count
             st.session_state.poll_email_subjects = [
                 e.get("subject", "(no subject)") for e in result.output
             ]
 
-            # Also push into the Email Inbox tab state so they're ready
+            # Push into the Email Inbox tab state so they appear immediately
             st.session_state.fetched_emails = result.output
-
-            if new_count > old_count and old_count > 0:
-                st.session_state.poll_new_alert = True
-            else:
-                st.session_state.poll_new_alert = False
         else:
             st.session_state.poll_email_count = 0
             st.session_state.poll_email_subjects = []
@@ -574,7 +588,7 @@ def _email_poll_fragment(components: dict):
     except Exception:
         pass
 
-    # Display
+    # Display in sidebar
     count = st.session_state.poll_email_count
     last = st.session_state.poll_last_check
     is_new = st.session_state.get("poll_new_alert", False)
