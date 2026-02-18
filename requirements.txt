@@ -1,0 +1,8 @@
+streamlit>=1.37.0
+python-dotenv
+google-generativeai
+numpy
+pydantic
+rich
+langsmith
+pandas
