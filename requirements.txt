@@ -6,3 +6,5 @@ pydantic
 rich
 langsmith
 pandas
+slack_sdk
+python-docx

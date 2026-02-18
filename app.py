@@ -30,15 +30,13 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 import streamlit as st
 
 # Bridge Streamlit Cloud secrets into os.environ so fragments' os.getenv() works.
-# On Streamlit Cloud, secrets are configured in the dashboard and exposed via
-# st.secrets.  On local, they come from .env via load_dotenv above.
 try:
     for key in ("GEMINI_API_KEY", "EMAIL_ADDRESS", "EMAIL_PASSWORD",
                 "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
         if key in st.secrets and key not in os.environ:
             os.environ[key] = st.secrets[key]
 except Exception:
-    pass  # st.secrets may not exist locally
+    pass
 # ---------------------------------------------------------------------------
 # Part 2: Page configuration and custom CSS
 # ---------------------------------------------------------------------------
@@ -265,6 +263,7 @@ def init_agents():
     # Tool classes
     POGenerator = ns["POGenerator"]
     EmailTool = ns["EmailTool"]
+    SlackTool = ns["SlackTool"]
 
     TEMPLATES_DIR = os.path.join(PROJECT_ROOT, "Templates")
 
@@ -290,7 +289,9 @@ def init_agents():
     po_tool = POGenerator(templates_dir=TEMPLATES_DIR)
     email_addr = ns.get("EMAIL_ADDRESS", "")
     email_pass = ns.get("EMAIL_PASSWORD", "")
-    email_tool = EmailTool(email_address=email_addr, password=email_pass)  # live mode
+    email_tool = EmailTool(email_address=email_addr, password=email_pass)
+    slack_token = ns.get("SLACK_BOT_TOKEN", "")
+    slack_tool = SlackTool(token=slack_token, default_channel="#agenticai-group-9")
     executor = ExecutorAgent(state, po_tool, long_term_mem,
                              session_mem=session_mem, email_tool=email_tool)
     critic = CriticAgent(state)
@@ -312,9 +313,9 @@ def init_agents():
         "long_term_mem": long_term_mem,
         "LoopState": LoopState,
         "TEMPLATES_DIR": TEMPLATES_DIR,
-        # For evaluation tab - pass the namespace and class references
         "ns": ns,
         "email_tool": email_tool,
+        "slack_tool": slack_tool,
         "KnowledgeState": KnowledgeState,
         "SessionMemory": SessionMemory,
         "AdaptiveConfig": AdaptiveConfig,
@@ -325,6 +326,7 @@ def init_agents():
         "OrchestratorAgent": OrchestratorAgent,
         "POGenerator": POGenerator,
         "EmailTool": EmailTool,
+        "SlackTool": SlackTool,
     }
 
 
@@ -397,6 +399,58 @@ def process_user_message(message: str, components: dict) -> dict:
         "plan": state.current_plan,
         "trajectory": trajectory_lines,
     }
+
+
+def post_result_to_slack(result: dict, source: str, components: dict):
+    """
+    Post agent response + artifacts to the Slack channel.
+    Called automatically after every message processing.
+    """
+    slack_tool = components.get("slack_tool")
+    if not slack_tool or not getattr(slack_tool, 'client', None):
+        return  # no live Slack configured
+
+    intent = result.get("intent", "UNKNOWN")
+    text = result.get("text", "No response")
+    groundedness = result.get("groundedness", 0)
+    adherence = result.get("adherence", 0)
+    verdict = result.get("verdict", "N/A")
+    retries = result.get("retries", 0)
+    replans = result.get("replans", 0)
+
+    header = f"[{intent}] Agent Response (via {source})"
+
+    loop_info = ""
+    if retries > 0 or replans > 0:
+        loop_info = f"\n[Adaptive: {retries} retries, {replans} replans]"
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": header[:150], "emoji": False}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Source:*\n{source}"},
+            {"type": "mrkdwn", "text": f"*Intent:*\n{intent}"}
+        ]},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900] + loop_info}},
+        {"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"*Scores:* G:{groundedness:.2f} | A:{adherence:.2f} | Verdict: {verdict}"}]}
+    ]
+
+    try:
+        slack_tool.post_message(text=header, blocks=blocks, channel="#agenticai-group-9")
+    except Exception as e:
+        logging.warning(f"Slack post failed: {e}")
+
+    # Upload any generated artifacts
+    artifacts = result.get("artifacts", [])
+    for art in artifacts:
+        file_path = art.file_path if hasattr(art, 'file_path') else str(art)
+        file_name = art.file_name if hasattr(art, 'file_name') else os.path.basename(str(art))
+        if os.path.exists(file_path):
+            try:
+                slack_tool.upload_file(file_path, f"Generated: {file_name}", "#agenticai-group-9")
+            except Exception as e:
+                logging.warning(f"Slack file upload failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +809,9 @@ def render_chat_tab(components: dict):
                 "artifacts": result["artifacts"],
             }
         })
+
+        # Auto-post to Slack for cross-channel visibility
+        post_result_to_slack(result, "Streamlit Chat", components)
 
 
 # ---------------------------------------------------------------------------
@@ -1155,7 +1212,157 @@ def render_logs_tab():
 
 
 # ---------------------------------------------------------------------------
-# Part 12: Main app entry point
+# Part 13: Slack Messages tab
+# ---------------------------------------------------------------------------
+def render_slack_tab(components: dict):
+    """Render the Slack channel interface with polling and agent processing."""
+    st.markdown("### Slack Channel")
+    st.caption("View and respond to messages from #agenticai-group-9")
+
+    slack_tool = components["slack_tool"]
+    has_live = getattr(slack_tool, 'client', None) is not None
+
+    # Initialize Slack state
+    if "slack_messages" not in st.session_state:
+        st.session_state.slack_messages = []
+    if "slack_responses" not in st.session_state:
+        st.session_state.slack_responses = {}
+    if "slack_last_ts" not in st.session_state:
+        import time as _time
+        st.session_state.slack_last_ts = str(_time.time() - 3600)
+
+    if not has_live:
+        st.warning(
+            "Slack is in mock mode. Add SLACK_BOT_TOKEN to your .env file "
+            "or Streamlit Cloud secrets to enable live Slack integration."
+        )
+        return
+
+    # Controls row
+    col1, col2, col3 = st.columns([1, 1, 3])
+    with col1:
+        if st.button("Fetch Messages", type="primary", use_container_width=True):
+            with st.spinner("Polling Slack channel..."):
+                result = slack_tool.fetch_messages(
+                    channel="#agenticai-group-9",
+                    oldest=st.session_state.slack_last_ts
+                )
+            if result.success and result.output:
+                # Filter out bot messages
+                human_msgs = [
+                    m for m in result.output
+                    if not m.get("bot_id") and m.get("text", "").strip()
+                ]
+                st.session_state.slack_messages = human_msgs
+                st.session_state.slack_responses = {}
+                st.rerun()
+            elif result.success:
+                st.session_state.slack_messages = []
+                st.info("No new messages in the channel.")
+            else:
+                st.error(f"Slack fetch failed: {result.error}")
+    with col2:
+        if st.button("Send to Slack", use_container_width=True):
+            st.session_state.show_slack_compose = True
+
+    # Compose new Slack message
+    if st.session_state.get("show_slack_compose", False):
+        with st.form("slack_compose"):
+            slack_msg = st.text_area("Message to post to #agenticai-group-9:")
+            submitted = st.form_submit_button("Post Message")
+            if submitted and slack_msg.strip():
+                result = slack_tool.post_message(
+                    text=slack_msg,
+                    channel="#agenticai-group-9"
+                )
+                if result.success:
+                    st.success("Message posted to Slack!")
+                    st.session_state.show_slack_compose = False
+                else:
+                    st.error(f"Failed: {result.error}")
+
+    st.divider()
+
+    # Display messages
+    msgs = st.session_state.slack_messages
+    if not msgs:
+        st.info("Click 'Fetch Messages' to load recent channel activity.")
+        return
+
+    st.success(f"{len(msgs)} message(s) from Slack")
+
+    for idx, msg in enumerate(msgs):
+        user = msg.get("user", "unknown")
+        text = msg.get("text", "")
+        ts = msg.get("ts", "")
+
+        # Format timestamp
+        try:
+            msg_time = datetime.datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+        except (ValueError, TypeError):
+            msg_time = "--:--:--"
+
+        with st.container():
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1e1e3f, #2d2b55);
+                        border: 1px solid #4c3d99; border-radius: 12px;
+                        padding: 16px; margin-bottom: 8px;">
+                <div style="display:flex; justify-content:space-between;">
+                    <span style="color:#b794f4; font-weight:600;">@{user}</span>
+                    <span style="color:#718096; font-size:0.8rem;">{msg_time}</span>
+                </div>
+                <div style="color:#e2e8f0; margin-top:8px;">{text[:500]}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Process button
+            if st.button(f"Process with Agent", key=f"slack_process_{idx}",
+                         use_container_width=True):
+                with st.spinner("Running agent pipeline..."):
+                    response = process_user_message(text, components)
+                st.session_state.slack_responses[idx] = response
+                # Auto-post result back to Slack
+                post_result_to_slack(response, f"Slack/@{user}", components)
+                st.rerun()
+
+            # Show agent response
+            if idx in st.session_state.slack_responses:
+                resp = st.session_state.slack_responses[idx]
+                st.markdown("---")
+                st.markdown("**Agent Response** (also posted to Slack):")
+                st.write(resp["text"])
+
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    render_intent_chip(resp["intent"])
+                with col_b:
+                    st.caption(f"Verdict: {resp['verdict']}")
+                with col_c:
+                    if resp["retries"] or resp["replans"]:
+                        st.caption(f"Retries: {resp['retries']} | Replans: {resp['replans']}")
+
+                render_score_bar("Groundedness", resp["groundedness"])
+                render_score_bar("Adherence", resp["adherence"])
+
+                # Artifacts
+                if resp.get("artifacts"):
+                    for art in resp["artifacts"]:
+                        file_path = art.file_path if hasattr(art, 'file_path') else str(art)
+                        file_name = art.file_name if hasattr(art, 'file_name') else os.path.basename(str(art))
+                        if os.path.exists(file_path):
+                            with open(file_path, "rb") as f:
+                                st.download_button(
+                                    f"Download {file_name}",
+                                    f.read(),
+                                    file_name=file_name,
+                                    key=f"dl_slack_{idx}_{file_name}"
+                                )
+
+            st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Part 14: Main app entry point
 # ---------------------------------------------------------------------------
 def main():
     """Main application entry point."""
@@ -1172,8 +1379,9 @@ def main():
     st.markdown("# Knowledge Nexus v3.0")
     st.caption("Multi-Agent Supply Chain System | CMU Agentic AI - Spring 2026")
 
-    chat_tab, email_tab, eval_tab, logs_tab = st.tabs(
-        ["Chat with Agent", "Email Inbox", "Evaluation Dashboard", "Agent Logs"]
+    chat_tab, email_tab, slack_tab, eval_tab, logs_tab = st.tabs(
+        ["Chat with Agent", "Email Inbox", "Slack Channel",
+         "Evaluation Dashboard", "Agent Logs"]
     )
 
     with chat_tab:
@@ -1181,6 +1389,9 @@ def main():
 
     with email_tab:
         render_email_tab(components)
+
+    with slack_tab:
+        render_slack_tab(components)
 
     with eval_tab:
         render_eval_tab(components)
