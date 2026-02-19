@@ -534,9 +534,20 @@ class PersistentLongTermMemory:
 
     # --- Write Policy ---
     def add_deal(self, po_details: Dict[str, Any]):
-        """Write a completed deal to persistent storage."""
+        """Write a completed deal to persistent storage.
+        If a deal with the same X_ReferenceNumber already exists,
+        replace it instead of appending a duplicate (prevents
+        duplicates from adaptive retries/replans).
+        """
         po_details["timestamp"] = str(datetime.datetime.now())
         po_details["id"] = str(uuid.uuid4())
+        ref = po_details.get("X_ReferenceNumber")
+        if ref:
+            # Replace existing deal with the same reference number
+            self._data["deals"] = [
+                d for d in self._data["deals"]
+                if d.get("X_ReferenceNumber") != ref
+            ]
         self._data["deals"].append(po_details)
         self._prune_deals()
         self._save_to_disk()

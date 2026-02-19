@@ -622,6 +622,17 @@ class ExecutorAgent(BaseAgent):
             for meta_key in ['timestamp', 'id']:
                 updated_data.pop(meta_key, None)
 
+            # Generate a new unique reference number for the edited PO
+            # so it is stored as a distinct entry from the original.
+            import random
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            new_ref = f"REF-{today_str}-{random.randint(100, 999)}"
+            old_ref = updated_data.get('X_ReferenceNumber', '?')
+            updated_data['X_ReferenceNumber'] = new_ref
+            self.state.add_trace(
+                f"Executor: EDIT_PO assigned new ref {new_ref} (was {old_ref})"
+            )
+
             # Regenerate the document
             template_name = "CCD-EMI-PL.docx"
             tool_res = self.po_tool.execute(template_name, updated_data)
@@ -634,7 +645,7 @@ class ExecutorAgent(BaseAgent):
                     file_path=file_path, file_type="docx",
                     content_preview=f"Edited fields: {list(changes.keys())}"
                 ))
-                # Update the deal in long-term memory
+                # Save the edited PO as a new deal in long-term memory
                 self.long_term_mem.add_deal(updated_data)
                 return response_text, generated_artifacts, 3
             else:
@@ -658,7 +669,27 @@ class ExecutorAgent(BaseAgent):
             return "Email Tool not available.", 0
 
     def _handle_query(self):
-        prompt = f"Draft answer for user query based on docs.\nQuery: {self.state.raw_email_body}\nDocs: {self.state.retrieved_chunks}"
+        # Include deal data from long-term memory so the LLM can
+        # answer PO-related questions (counts, references, etc.).
+        deals = self.long_term_mem.get_recent_deals(limit=20)
+        deal_summary = "No POs in the system."
+        if deals:
+            lines = [f"Total POs in system: {len(deals)}"]
+            for i, d in enumerate(deals):
+                ref = d.get('X_ReferenceNumber', 'N/A')
+                product = d.get('product_description', d.get('X_CargoDescription', 'Unknown'))
+                dest = d.get('X_Destination', 'N/A')
+                qty = d.get('qty', 'N/A')
+                lines.append(f"  {i+1}. Ref={ref} | {product} | To: {dest} | Qty: {qty}")
+            deal_summary = "\n".join(lines)
+
+        prompt = (
+            f"Answer the user's supply-chain query using the documents AND "
+            f"the deal/PO data below.\n\n"
+            f"Query: {self.state.raw_email_body}\n\n"
+            f"Documents:\n{self.state.retrieved_chunks}\n\n"
+            f"PO / Deal Data:\n{deal_summary}"
+        )
         response_text = self.llm.generate(prompt)
         return response_text, 2
 
